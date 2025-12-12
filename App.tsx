@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
 */
 import React, { useState, useEffect, useRef } from 'react';
-import { Layout, Box, Image as ImageIcon, Wand2, Layers, Plus, Trash2, Download, History, Sparkles, Shirt, Move, Maximize, RotateCcw, Zap, Cpu, ArrowRight, Globe, Scan, Camera, Aperture, Repeat, SprayCan, Triangle, Package, Menu, X, Check, MousePointer2 } from 'lucide-react';
+import { Layout, Box, Image as ImageIcon, Wand2, Layers, Plus, Trash2, Download, History, Sparkles, Shirt, Move, Maximize, RotateCcw, Zap, Cpu, ArrowRight, Globe, Scan, Camera, Aperture, Repeat, SprayCan, Triangle, Package, Menu, X, Check, MousePointer2, Scissors, ScanFace } from 'lucide-react';
 import { Button } from './components/Button';
 import { FileUploader } from './components/FileUploader';
-import { generateMockup, generateAsset, generateRealtimeComposite } from './services/geminiService';
+import { generateAsset, analyzeScene, isolateObject } from './services/geminiService';
 import { Asset, GeneratedMockup, AppView, LoadingState, PlacedLayer } from './types';
 import { useApiKey } from './hooks/useApiKey';
 import ApiKeyDialog from './components/ApiKeyDialog';
@@ -151,8 +151,8 @@ const IntroSequence = ({ onComplete }: { onComplete: () => void }) => {
              
              {/* Text Reveal */}
              <div className="text-center animate-[popIn_0.8s_cubic-bezier(0.17,0.67,0.83,0.67)_0.5s_forwards] opacity-0">
-                <h1 className="text-5xl font-black text-white tracking-tighter mb-2">SKU FOUNDRY</h1>
-                <p className="text-sm text-indigo-400 font-mono tracking-[0.3em] uppercase">AI Product Visualization</p>
+                <h1 className="text-5xl font-black text-white tracking-tighter mb-2">OBJECT EXTRACTOR</h1>
+                <p className="text-sm text-indigo-400 font-mono tracking-[0.3em] uppercase">AI Background Removal</p>
              </div>
           </div>
         )}
@@ -185,7 +185,7 @@ const NavButton = ({ icon, label, active, onClick, number }: { icon: React.React
 const WorkflowStepper = ({ currentView, onViewChange }: { currentView: AppView, onViewChange: (view: AppView) => void }) => {
   const steps = [
     { id: 'assets', label: 'Upload Assets', number: 1 },
-    { id: 'studio', label: 'Design Mockup', number: 2 },
+    { id: 'studio', label: 'Extract Objects', number: 2 },
     { id: 'gallery', label: 'Download Result', number: 3 },
   ];
 
@@ -384,10 +384,11 @@ export default function App() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [selectedMockup, setSelectedMockup] = useState<GeneratedMockup | null>(null); // State for lightbox
 
-  // Form states for generation
-  const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
-  const [placedLogos, setPlacedLogos] = useState<PlacedLayer[]>([]);
-  const [prompt, setPrompt] = useState('');
+  // -- Extraction Workflow States --
+  const [selectedSceneId, setSelectedSceneId] = useState<string | null>(null);
+  const [detectedObjects, setDetectedObjects] = useState<string[]>([]);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [extractionResult, setExtractionResult] = useState<string | null>(null);
   const [loading, setLoading] = useState<LoadingState>({ isGenerating: false, message: '' });
 
   // API Key Management
@@ -419,10 +420,6 @@ export default function App() {
     }
   };
 
-  // State for Dragging
-  const canvasRef = useRef<HTMLDivElement>(null);
-  const [draggedItem, setDraggedItem] = useState<{ uid: string, startX: number, startY: number, initX: number, initY: number } | null>(null);
-
   // Demo assets on load
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -431,165 +428,59 @@ export default function App() {
     return () => clearTimeout(timer);
   }, []);
 
-  // -- LOGO PLACEMENT HANDLERS --
+  // -- HANDLERS --
 
-  const addLogoToCanvas = (assetId: string) => {
-    // Add new instance of logo to canvas at center
-    const newLayer: PlacedLayer = {
-      uid: Math.random().toString(36).substr(2, 9),
-      assetId,
-      x: 50,
-      y: 50,
-      scale: 1,
-      rotation: 0
-    };
-    setPlacedLogos(prev => [...prev, newLayer]);
-  };
-
-  const removeLogoFromCanvas = (uid: string, e?: React.MouseEvent | React.TouchEvent) => {
-    e?.stopPropagation();
-    setPlacedLogos(prev => prev.filter(l => l.uid !== uid));
-  };
-
-  const handleStart = (clientX: number, clientY: number, layer: PlacedLayer) => {
-    setDraggedItem({
-      uid: layer.uid,
-      startX: clientX,
-      startY: clientY,
-      initX: layer.x,
-      initY: layer.y
-    });
-  };
-
-  const handleMouseDown = (e: React.MouseEvent, layer: PlacedLayer) => {
-    e.preventDefault();
-    e.stopPropagation();
-    handleStart(e.clientX, e.clientY, layer);
-  };
-
-  const handleTouchStart = (e: React.TouchEvent, layer: PlacedLayer) => {
-    e.stopPropagation(); // Prevent scrolling initiation if possible
-    const touch = e.touches[0];
-    handleStart(touch.clientX, touch.clientY, layer);
-  };
-
-  const handleWheel = (e: React.WheelEvent, layerId: string) => {
-     e.stopPropagation();
-     // Simple scale on scroll
-     const delta = e.deltaY > 0 ? -0.1 : 0.1;
-     setPlacedLogos(prev => prev.map(l => {
-        if (l.uid !== layerId) return l;
-        const newScale = Math.max(0.2, Math.min(3.0, l.scale + delta));
-        return { ...l, scale: newScale };
-     }));
-  };
-
-  // Global mouse/touch move for dragging
-  useEffect(() => {
-    const handleMove = (clientX: number, clientY: number) => {
-      if (!draggedItem || !canvasRef.current) return;
-
-      const rect = canvasRef.current.getBoundingClientRect();
-      const deltaX = clientX - draggedItem.startX;
-      const deltaY = clientY - draggedItem.startY;
-
-      // Convert pixels to percentage
-      const deltaXPercent = (deltaX / rect.width) * 100;
-      const deltaYPercent = (deltaY / rect.height) * 100;
-
-      setPlacedLogos(prev => prev.map(l => {
-        if (l.uid !== draggedItem.uid) return l;
-        return {
-          ...l,
-          x: Math.max(0, Math.min(100, draggedItem.initX + deltaXPercent)),
-          y: Math.max(0, Math.min(100, draggedItem.initY + deltaYPercent))
-        };
-      }));
-    };
-
-    const onMouseMove = (e: MouseEvent) => {
-      handleMove(e.clientX, e.clientY);
-    };
-
-    const onMouseUp = () => {
-      setDraggedItem(null);
-    };
-
-    const onTouchMove = (e: TouchEvent) => {
-      if (draggedItem) {
-         e.preventDefault(); // Prevent scrolling while dragging
-         handleMove(e.touches[0].clientX, e.touches[0].clientY);
-      }
-    };
-
-    const onTouchEnd = () => {
-      setDraggedItem(null);
-    };
-
-    if (draggedItem) {
-      window.addEventListener('mousemove', onMouseMove);
-      window.addEventListener('mouseup', onMouseUp);
-      window.addEventListener('touchmove', onTouchMove, { passive: false }); // passive: false needed for preventDefault
-      window.addEventListener('touchend', onTouchEnd);
-    }
-
-    return () => {
-      window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
-      window.removeEventListener('touchmove', onTouchMove);
-      window.removeEventListener('touchend', onTouchEnd);
-    };
-  }, [draggedItem]);
-
-
-  const handleGenerate = async () => {
-    // We don't return early for empty selections here so we can give better user feedback
-    if (!selectedProductId && placedLogos.length === 0) {
-        // Although button is disabled, safety check
-        return;
-    }
+  const handleSceneSelect = async (id: string) => {
+    if (id === selectedSceneId) return;
     
-    const product = assets.find(a => a.id === selectedProductId);
-    if (!product) {
-        alert("Selected product not found. Please select a product.");
-        // Deselect the invalid ID so the UI updates
-        setSelectedProductId(null);
-        return;
+    // Check API Key before proceeding
+    if (!(await validateApiKey())) {
+       return;
     }
 
-    // Prepare all layers
-    const layers = placedLogos.map(layer => {
-        const asset = assets.find(a => a.id === layer.assetId);
-        return asset ? { asset, placement: layer } : null;
-    }).filter(Boolean) as { asset: Asset, placement: PlacedLayer }[];
-
-    if (layers.length === 0) {
-         alert("No valid logos found on canvas. Please add a logo.");
-         return;
+    setSelectedSceneId(id);
+    setExtractionResult(null);
+    setDetectedObjects([]);
+    setIsAnalyzing(true);
+    
+    try {
+        const sceneAsset = assets.find(a => a.id === id);
+        if (sceneAsset) {
+            const objects = await analyzeScene(sceneAsset);
+            setDetectedObjects(objects);
+        }
+    } catch (e: any) {
+        console.error(e);
+        handleApiError(e);
+    } finally {
+        setIsAnalyzing(false);
     }
+  };
+
+  const handleExtract = async (objectName: string) => {
+    const sceneAsset = assets.find(a => a.id === selectedSceneId);
+    if (!sceneAsset) return;
 
     // Check API Key before proceeding
     if (!(await validateApiKey())) {
       return;
     }
 
-    const currentPrompt = prompt;
-
-    setLoading({ isGenerating: true, message: 'Analyzing composite geometry...' });
+    setLoading({ isGenerating: true, message: `Isolating ${objectName}...` });
     try {
-      const resultImage = await generateMockup(product, layers, currentPrompt);
+      const resultImage = await isolateObject(sceneAsset, objectName);
+      setExtractionResult(resultImage);
       
-      const newMockup: GeneratedMockup = {
+      const newExtraction: GeneratedMockup = {
         id: Math.random().toString(36).substring(7),
         imageUrl: resultImage,
-        prompt: currentPrompt,
+        prompt: `Isolated ${objectName}`,
         createdAt: Date.now(),
-        layers: placedLogos, // Save the layout
-        productId: selectedProductId
+        productId: selectedSceneId || undefined
       };
       
-      setGeneratedMockups(prev => [newMockup, ...prev]);
-      setView('gallery');
+      setGeneratedMockups(prev => [newExtraction, ...prev]);
+      // Optional: Don't switch view immediately so they can see result
     } catch (e: any) {
       console.error(e);
       handleApiError(e);
@@ -614,7 +505,7 @@ export default function App() {
       <aside className="w-64 border-r border-zinc-800 bg-zinc-950/50 hidden md:flex flex-col">
         <div className="h-16 border-b border-zinc-800 flex items-center px-6">
           <Package className="text-indigo-500 mr-2" />
-          <span className="font-bold text-lg tracking-tight">SKU FOUNDRY</span>
+          <span className="font-bold text-lg tracking-tight">OBJECT EXTRACTOR</span>
         </div>
 
         <div className="p-4 space-y-2 flex-1">
@@ -632,8 +523,8 @@ export default function App() {
             onClick={() => setView('assets')} 
           />
           <NavButton 
-            icon={<Wand2 size={18} />} 
-            label="Studio" 
+            icon={<Scissors size={18} />} 
+            label="Extractor" 
             active={view === 'studio'} 
             number={2}
             onClick={() => setView('studio')} 
@@ -658,7 +549,7 @@ export default function App() {
       <div className="md:hidden fixed top-0 left-0 right-0 h-16 bg-zinc-950 border-b border-zinc-800 flex items-center justify-between px-4 z-50">
         <div className="flex items-center">
           <Package className="text-indigo-500 mr-2" />
-          <span className="font-bold text-lg">SKU FOUNDRY</span>
+          <span className="font-bold text-lg">EXTRACTOR</span>
         </div>
         <button onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)} className="p-2 text-zinc-400 hover:text-white">
           {isMobileMenuOpen ? <X /> : <Menu />}
@@ -683,8 +574,8 @@ export default function App() {
               onClick={() => { setView('assets'); setIsMobileMenuOpen(false); }} 
             />
             <NavButton 
-              icon={<Wand2 size={18} />} 
-              label="Studio" 
+              icon={<Scissors size={18} />} 
+              label="Extractor" 
               active={view === 'studio'} 
               number={2}
               onClick={() => { setView('studio'); setIsMobileMenuOpen(false); }} 
@@ -699,7 +590,7 @@ export default function App() {
           </div>
           
           <div className="mt-auto pb-8 border-t border-zinc-800 pt-6">
-              <p className="text-xs text-zinc-500 text-center mb-4">SKU FOUNDRY Mobile v1.0</p>
+              <p className="text-xs text-zinc-500 text-center mb-4">Object Extractor Mobile v1.0</p>
           </div>
         </div>
       )}
@@ -731,12 +622,12 @@ export default function App() {
             {/* Caption / Actions */}
             <div className="mt-4 bg-zinc-900/90 backdrop-blur border border-zinc-700 px-6 py-3 rounded-full flex items-center gap-4">
                <p className="text-sm text-zinc-300 max-w-[200px] md:max-w-md truncate">
-                 {selectedMockup.prompt || "Generated Mockup"}
+                 {selectedMockup.prompt || "Extraction Result"}
                </p>
                <div className="h-4 w-px bg-zinc-700"></div>
                <a 
                  href={selectedMockup.imageUrl} 
-                 download={`mockup-${selectedMockup.id}.png`}
+                 download={`extraction-${selectedMockup.id}.png`}
                  className="text-indigo-400 hover:text-indigo-300 text-sm font-medium flex items-center gap-2"
                >
                  <Download size={16} />
@@ -768,22 +659,22 @@ export default function App() {
               <div className="animate-fade-in space-y-8">
                  <div className="text-center py-12">
                     <h1 className="text-4xl md:text-6xl font-black mb-6 text-white">
-                       Create Realistic <br/>
-                       <span className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 via-purple-400 to-pink-500">Merchandise Mockups</span>
+                       Intelligent <br/>
+                       <span className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 via-purple-400 to-pink-500">Object Extraction</span>
                     </h1>
                     <p className="text-zinc-400 text-lg max-w-2xl mx-auto mb-10">
-                       Upload your logos and products, and let our AI composite them perfectly with realistic lighting, shadows, and warping.
+                       Upload any scene and instantly isolate specific objects with AI-powered precision. Remove backgrounds while preserving lighting and texture.
                     </p>
                     <Button size="lg" onClick={() => setView('assets')} icon={<ArrowRight size={20} />}>
-                       Start Creating
+                       Start Extracting
                     </Button>
                  </div>
 
                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                     {[
-                       { icon: <Box className="text-indigo-400" />, title: 'Asset Management', desc: 'Organize logos and product bases.' },
-                       { icon: <Wand2 className="text-purple-400" />, title: 'AI Compositing', desc: 'Smart blending and surface mapping.' },
-                       { icon: <Download className="text-pink-400" />, title: 'High-Res Export', desc: 'Production-ready visuals.' }
+                       { icon: <Box className="text-indigo-400" />, title: 'Scene Analysis', desc: 'AI identifies all distinct objects in your image.' },
+                       { icon: <ScanFace className="text-purple-400" />, title: 'Smart Isolation', desc: 'Precise cropping and background removal.' },
+                       { icon: <Download className="text-pink-400" />, title: 'High-Res Export', desc: 'Download transparent or white-bg assets.' }
                     ].map((feat, i) => (
                        <div key={i} className="p-6 rounded-2xl bg-zinc-900/50 border border-zinc-800 hover:border-indigo-500/30 transition-colors">
                           <div className="mb-4 p-3 bg-zinc-900 w-fit rounded-lg">{feat.icon}</div>
@@ -809,9 +700,9 @@ export default function App() {
                 <WorkflowStepper currentView="assets" onViewChange={setView} />
                 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                  {/* Products Section */}
+                  {/* Products Section -> Renamed to Scenes */}
                   <AssetSection 
-                    title="Products" 
+                    title="Scenes / Products" 
                     icon={<Box size={20} />}
                     type="product"
                     assets={assets.filter(a => a.type === 'product')}
@@ -821,9 +712,9 @@ export default function App() {
                     onApiError={handleApiError}
                   />
 
-                  {/* Logos Section */}
+                  {/* Logos Section -> Renamed to References */}
                   <AssetSection 
-                    title="Logos & Graphics" 
+                    title="References / Logos" 
                     icon={<Layers size={20} />}
                     type="logo"
                     assets={assets.filter(a => a.type === 'logo')}
@@ -835,8 +726,8 @@ export default function App() {
                 </div>
 
                 <div className="mt-8 flex justify-end">
-                   <Button onClick={() => setView('studio')} disabled={assets.length < 2} icon={<ArrowRight size={16} />}>
-                      Continue to Studio
+                   <Button onClick={() => setView('studio')} disabled={assets.filter(a => a.type === 'product').length === 0} icon={<ArrowRight size={16} />}>
+                      Continue to Extractor
                    </Button>
                 </div>
               </div>
@@ -847,74 +738,81 @@ export default function App() {
              <div className="animate-fade-in h-[calc(100vh-8rem)] md:h-[calc(100vh-12rem)] flex flex-col-reverse lg:flex-row gap-4 lg:gap-6">
                 {/* Left Controls (Bottom on Mobile) */}
                 <div className="w-full lg:w-80 flex flex-col gap-6 glass-panel p-6 rounded-2xl overflow-y-auto flex-1 lg:flex-none">
+                   
+                   {/* Step 1: Scene Selection */}
                    <div>
-                      <h3 className="text-sm font-bold text-zinc-300 uppercase tracking-wider mb-4">1. Select Product</h3>
+                      <h3 className="text-sm font-bold text-zinc-300 uppercase tracking-wider mb-4 flex items-center gap-2">
+                        <span className="bg-zinc-800 w-5 h-5 rounded-full flex items-center justify-center text-xs">1</span>
+                        Select Scene
+                      </h3>
                       <div className="grid grid-cols-3 gap-2">
                          {assets.filter(a => a.type === 'product').map(a => (
                             <div 
                                key={a.id} 
-                               onClick={() => setSelectedProductId(selectedProductId === a.id ? null : a.id)}
-                               className={`aspect-square rounded-lg border-2 cursor-pointer p-1 transition-all ${selectedProductId === a.id ? 'border-indigo-500 bg-indigo-500/20' : 'border-zinc-700 hover:border-zinc-500 bg-zinc-900'}`}
+                               onClick={() => handleSceneSelect(a.id)}
+                               className={`aspect-square rounded-lg border-2 cursor-pointer p-1 transition-all relative
+                                  ${selectedSceneId === a.id ? 'border-indigo-500 bg-indigo-500/20' : 'border-zinc-700 hover:border-zinc-500 bg-zinc-900'}
+                               `}
                             >
                                <img src={a.data} className="w-full h-full object-contain" alt={a.name} />
-                            </div>
-                         ))}
-                         {assets.filter(a => a.type === 'product').length === 0 && <p className="text-xs text-zinc-400 col-span-3">No products uploaded</p>}
-                      </div>
-                   </div>
-
-                   <div>
-                      <div className="flex items-center justify-between mb-4">
-                        <h3 className="text-sm font-bold text-zinc-300 uppercase tracking-wider">2. Add Logos</h3>
-                        {placedLogos.length > 0 && (
-                            <span className="text-xs text-indigo-400">{placedLogos.length} on canvas</span>
-                        )}
-                      </div>
-                      <p className="text-xs text-zinc-400 mb-2">Click to add. Drag on canvas to move. Scroll to resize.</p>
-                      <div className="grid grid-cols-3 gap-2">
-                         {assets.filter(a => a.type === 'logo').map(a => (
-                            <div 
-                               key={a.id} 
-                               onClick={() => addLogoToCanvas(a.id)}
-                               className={`relative aspect-square rounded-lg border-2 cursor-pointer p-1 transition-all border-zinc-700 hover:border-zinc-500 bg-zinc-900`}
-                            >
-                               <img src={a.data} className="w-full h-full object-contain" alt={a.name} />
-                               {/* Count badge */}
-                               {placedLogos.filter(l => l.assetId === a.id).length > 0 && (
-                                   <div className="absolute -top-2 -right-2 w-5 h-5 bg-indigo-600 rounded-full flex items-center justify-center text-[10px] font-bold border border-zinc-900">
-                                       {placedLogos.filter(l => l.assetId === a.id).length}
+                               {selectedSceneId === a.id && isAnalyzing && (
+                                   <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+                                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
                                    </div>
                                )}
                             </div>
                          ))}
-                         {assets.filter(a => a.type === 'logo').length === 0 && <p className="text-xs text-zinc-400 col-span-3">No logos uploaded</p>}
+                         {assets.filter(a => a.type === 'product').length === 0 && <p className="text-xs text-zinc-400 col-span-3">No scenes uploaded. Go to Assets.</p>}
                       </div>
                    </div>
 
+                   {/* Step 2: Object Extraction */}
                    <div>
-                      <h3 className="text-sm font-bold text-zinc-300 uppercase tracking-wider mb-4">3. Instructions</h3>
-                      <textarea 
-                         className="w-full bg-zinc-900 border border-zinc-700 rounded-lg p-3 text-base text-white focus:ring-2 focus:ring-indigo-500 focus:outline-none resize-none h-24"
-                         placeholder="E.g. Embed the logos into the fabric texture..."
-                         value={prompt}
-                         onChange={(e) => setPrompt(e.target.value)}
-                      />
+                      <h3 className="text-sm font-bold text-zinc-300 uppercase tracking-wider mb-4 flex items-center gap-2">
+                         <span className="bg-zinc-800 w-5 h-5 rounded-full flex items-center justify-center text-xs">2</span>
+                         Extract Object
+                      </h3>
+                      
+                      {!selectedSceneId ? (
+                        <p className="text-xs text-zinc-500 italic">Select a scene to detect objects.</p>
+                      ) : isAnalyzing ? (
+                        <div className="p-4 border border-zinc-800 rounded-lg bg-zinc-900/50 flex flex-col items-center gap-2">
+                           <Scan className="animate-pulse text-indigo-500" />
+                           <span className="text-xs text-zinc-400">Analyzing scene...</span>
+                        </div>
+                      ) : detectedObjects.length > 0 ? (
+                         <div className="flex flex-col gap-2">
+                            {detectedObjects.map((obj, i) => (
+                               <button 
+                                 key={i}
+                                 onClick={() => handleExtract(obj)}
+                                 disabled={loading.isGenerating}
+                                 className="w-full p-3 bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 hover:border-indigo-500 rounded-lg text-left transition-all flex items-center justify-between group disabled:opacity-50"
+                               >
+                                  <span className="text-sm font-medium">{obj}</span>
+                                  <ArrowRight size={14} className="opacity-0 group-hover:opacity-100 transition-opacity text-indigo-400" />
+                               </button>
+                            ))}
+                         </div>
+                      ) : (
+                         <div className="p-4 border border-dashed border-zinc-800 rounded-lg text-center">
+                            <p className="text-xs text-zinc-500">No objects detected or analysis failed.</p>
+                            <Button size="sm" variant="ghost" onClick={() => selectedSceneId && handleSceneSelect(selectedSceneId)} className="mt-2 text-xs">Retry Analysis</Button>
+                         </div>
+                      )}
                    </div>
 
-                   <Button 
-                      onClick={handleGenerate} 
-                      isLoading={loading.isGenerating} 
-                      disabled={!selectedProductId || placedLogos.length === 0} 
-                      size="lg" 
-                      className="mt-auto"
-                      icon={<Wand2 size={18} />}
-                   >
-                      Generate Mockup
-                   </Button>
+                   {extractionResult && (
+                      <div className="mt-auto pt-4 border-t border-zinc-800">
+                         <Button onClick={() => setView('gallery')} variant="secondary" className="w-full" icon={<ImageIcon size={16} />}>
+                            View in Gallery
+                         </Button>
+                      </div>
+                   )}
                 </div>
 
                 {/* Right Preview - Canvas (Top on Mobile) */}
-                <div className="h-[45vh] lg:h-auto lg:flex-1 glass-panel rounded-2xl flex items-center justify-center bg-zinc-900 relative overflow-hidden select-none flex-shrink-0">
+                <div className="h-[45vh] lg:h-auto lg:flex-1 glass-panel rounded-2xl flex items-center justify-center bg-zinc-900 relative overflow-hidden flex-shrink-0">
                    {loading.isGenerating && (
                       <div className="absolute inset-0 z-20 bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center">
                          <div className="w-16 h-16 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mb-4"></div>
@@ -922,68 +820,38 @@ export default function App() {
                       </div>
                    )}
                    
-                   {selectedProductId ? (
-                      <div 
-                         ref={canvasRef}
-                         className="relative w-full h-full max-h-[600px] p-4"
-                      >
-                         {/* Product Base */}
+                   {/* Background Grid for Transparency */}
+                   <div className="absolute inset-0 z-0 bg-[linear-gradient(45deg,#1f1f23_25%,transparent_25%,transparent_75%,#1f1f23_75%,#1f1f23),linear-gradient(45deg,#1f1f23_25%,transparent_25%,transparent_75%,#1f1f23_75%,#1f1f23)] bg-[size:20px_20px] bg-[position:0_0,10px_10px] opacity-20"></div>
+
+                   {extractionResult ? (
+                      <div className="relative w-full h-full p-8 flex items-center justify-center z-10 animate-fade-in">
+                          <img 
+                            src={extractionResult} 
+                            className="max-w-full max-h-full object-contain drop-shadow-2xl" 
+                            alt="Extraction Result" 
+                          />
+                          <div className="absolute top-4 right-4 flex gap-2">
+                             <Button size="sm" variant="secondary" onClick={() => setExtractionResult(null)} icon={<RotateCcw size={14}/>}>Reset</Button>
+                             <a href={extractionResult} download="extracted-object.png">
+                                <Button size="sm" icon={<Download size={14}/>}>Download</Button>
+                             </a>
+                          </div>
+                      </div>
+                   ) : selectedSceneId ? (
+                      <div className="relative w-full h-full p-4 flex items-center justify-center z-10">
                          <img 
-                            src={assets.find(a => a.id === selectedProductId)?.data} 
-                            className="w-full h-full object-contain drop-shadow-2xl pointer-events-none select-none" 
-                            alt="Preview" 
-                            draggable={false}
+                            src={assets.find(a => a.id === selectedSceneId)?.data} 
+                            className="max-w-full max-h-full object-contain drop-shadow-xl" 
+                            alt="Original Scene" 
                          />
-
-                         {/* Overlay Layers */}
-                         {placedLogos.map((layer) => {
-                            const logoAsset = assets.find(a => a.id === layer.assetId);
-                            if (!logoAsset) return null;
-                            const isDraggingThis = draggedItem?.uid === layer.uid;
-
-                            return (
-                               <div
-                                  key={layer.uid}
-                                  className={`absolute cursor-move group ${isDraggingThis ? 'z-50 opacity-80' : 'z-10'}`}
-                                  style={{
-                                     left: `${layer.x}%`,
-                                     top: `${layer.y}%`,
-                                     transform: `translate(-50%, -50%) scale(${layer.scale}) rotate(${layer.rotation}deg)`,
-                                     // We use a fixed width for the container relative to viewport/container would be better but simplified here
-                                     width: '15%', // Base width relative to container
-                                     aspectRatio: '1/1'
-                                  }}
-                                  onMouseDown={(e) => handleMouseDown(e, layer)}
-                                  onTouchStart={(e) => handleTouchStart(e, layer)}
-                                  onWheel={(e) => handleWheel(e, layer.uid)}
-                               >
-                                  {/* Selection Border */}
-                                  <div className="absolute -inset-2 border-2 border-indigo-500/0 group-hover:border-indigo-500/50 rounded-lg transition-all pointer-events-none"></div>
-                                  
-                                  {/* Remove Button */}
-                                  <button 
-                                    onClick={(e) => removeLogoFromCanvas(layer.uid, e)}
-                                    onTouchEnd={(e) => removeLogoFromCanvas(layer.uid, e)}
-                                    className="absolute -top-4 -right-4 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition-opacity hover:scale-110 shadow-lg z-50"
-                                    title="Remove"
-                                  >
-                                    <X size={12} />
-                                  </button>
-
-                                  <img 
-                                     src={logoAsset.data} 
-                                     className="w-full h-full object-contain drop-shadow-lg pointer-events-none"
-                                     draggable={false}
-                                     alt="layer"
-                                  />
-                               </div>
-                            );
-                         })}
+                         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/60 backdrop-blur px-3 py-1 rounded-full text-xs text-zinc-400 border border-zinc-700">
+                            Original Scene
+                         </div>
                       </div>
                    ) : (
-                      <div className="text-center text-zinc-600">
-                         <Shirt size={64} className="mx-auto mb-4 opacity-20" />
-                         <p>Select a product to start designing</p>
+                      <div className="text-center text-zinc-600 z-10">
+                         <ScanFace size={64} className="mx-auto mb-4 opacity-20" />
+                         <p>Select a scene to begin extraction</p>
                       </div>
                    )}
                 </div>
@@ -994,15 +862,15 @@ export default function App() {
            {view === 'gallery' && (
               <div className="animate-fade-in">
                  <div className="flex items-center justify-between mb-8">
-                    <h2 className="text-2xl font-bold">Generated Mockups</h2>
-                    <Button variant="outline" onClick={() => setView('studio')} icon={<Plus size={16}/>}>New Mockup</Button>
+                    <h2 className="text-2xl font-bold">Extraction Library</h2>
+                    <Button variant="outline" onClick={() => setView('studio')} icon={<Plus size={16}/>}>New Extraction</Button>
                  </div>
 
                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                     {generatedMockups.map(mockup => (
                        <div key={mockup.id} className="group glass-panel rounded-xl overflow-hidden">
-                          <div className="aspect-square bg-zinc-900 relative overflow-hidden">
-                             <img src={mockup.imageUrl} className="w-full h-full object-cover transition-transform group-hover:scale-105" alt="Mockup" />
+                          <div className="aspect-square bg-zinc-900 relative overflow-hidden bg-[linear-gradient(45deg,#1f1f23_25%,transparent_25%,transparent_75%,#1f1f23_75%,#1f1f23),linear-gradient(45deg,#1f1f23_25%,transparent_25%,transparent_75%,#1f1f23_75%,#1f1f23)] bg-[size:20px_20px] bg-[position:0_0,10px_10px]">
+                             <img src={mockup.imageUrl} className="w-full h-full object-contain transition-transform group-hover:scale-105 p-4" alt="Result" />
                              <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-2">
                                 <Button 
                                   size="sm" 
@@ -1012,28 +880,23 @@ export default function App() {
                                 >
                                   View
                                 </Button>
-                                <a href={mockup.imageUrl} download={`mockup-${mockup.id}.png`}>
+                                <a href={mockup.imageUrl} download={`extraction-${mockup.id}.png`}>
                                   <Button size="sm" variant="primary" icon={<Download size={16}/>}>Save</Button>
                                 </a>
                              </div>
                           </div>
                           <div className="p-4">
                              <p className="text-xs text-zinc-500 mb-1">{new Date(mockup.createdAt).toLocaleDateString()}</p>
-                             <p className="text-sm text-zinc-300 line-clamp-2">{mockup.prompt || "Auto-generated mockup"}</p>
-                             {mockup.layers && mockup.layers.length > 0 && (
-                                 <div className="mt-2 flex gap-1">
-                                     <span className="text-xs px-1.5 py-0.5 bg-zinc-800 rounded text-zinc-400">{mockup.layers.length} logos</span>
-                                 </div>
-                             )}
+                             <p className="text-sm text-zinc-300 line-clamp-2">{mockup.prompt || "Extraction"}</p>
                           </div>
                        </div>
                     ))}
                     {generatedMockups.length === 0 && (
                        <div className="col-span-full py-20 text-center glass-panel rounded-xl">
                           <ImageIcon size={48} className="mx-auto mb-4 text-zinc-700" />
-                          <h3 className="text-lg font-medium text-zinc-300">No mockups yet</h3>
-                          <p className="text-zinc-500 mb-6">Create your first design in the Studio</p>
-                          <Button onClick={() => setView('studio')}>Go to Studio</Button>
+                          <h3 className="text-lg font-medium text-zinc-300">No extractions yet</h3>
+                          <p className="text-zinc-500 mb-6">Extract your first object in the Extractor tab</p>
+                          <Button onClick={() => setView('studio')}>Go to Extractor</Button>
                        </div>
                     )}
                  </div>
